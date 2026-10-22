@@ -590,7 +590,9 @@ static void update_boss(void) {
         }
         if (idx >= 1 && --b->dash_t <= 0) {                         /* bosses 2 and 3 also charge */
             b->state = 1; b->dash_t = 40;
-            norm_to(dx, dy, (idx == 2 ? 900 : 780), &b->dvx, &b->dvy);
+            int cvx, cvy;
+            norm_to(dx, dy, (idx == 2 ? 900 : 780), &cvx, &cvy);
+            b->dvx = cvx; b->dvy = cvy;
         }
     } else if (b->state == 1) {                                     /* wind-up: blinks white */
         if (g.frame & 4) b->flash = 2;
