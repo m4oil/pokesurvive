@@ -13,8 +13,7 @@
 #include "game.h"
 
 /* ================================================================ tunables */
-#define ELITE_FIRST_FRAME   (60 * 60)       /* first elite appears at 1:00 */
-#define ELITE_EVERY_FRAME   (60 * 75)
+#define ES_SPEED            400             /* boss bullet speed, 1/256 px per frame */
 #define SHOT_LIFE           70
 #define BASE_FIRE_INTERVAL  40
 #define PICKUP_RADIUS       30
@@ -36,6 +35,7 @@
 #define PAL_ENEMY0 2
 #define PAL_GEM 6
 #define PAL_FLASH 7
+#define PAL_EBULLET 8
 
 /* BG1 palette banks */
 #define TP_WHITE 1
@@ -45,6 +45,13 @@
 #define TP_GREY  5
 
 Game g;
+
+static const u16 BOSS_AT_SEC[NUM_BOSSES] = { 90, 180, 270 };    /* 1:30, 3:00, 4:30 - the last one ends the game */
+static const s16 ROT_C[5] = { 256, 255, 250, 243, 234 };        /* cos, sin of m * 6 degrees */
+static const s16 ROT_S[5] = { 0, 27, 53, 79, 104 };
+static const s16 DIR24[24][2] = {{256,0},{247,66},{222,128},{181,181},{128,222},{66,247},{0,256},{-66,247},{-128,222},{-181,181},{-222,128},{-247,66},
+                                 {-256,0},{-247,-66},{-222,-128},{-181,-181},{-128,-222},{-66,-247},{0,-256},{66,-247},{128,-222},{181,-181},{222,-128},{247,-66}};
+static int boss_load = -1;                                      /* species whose tiles/palette must be uploaded in VBlank */
 
 /* ================================================================ helpers */
 static inline int iabs(int v) { return v < 0 ? -v : v; }
@@ -210,8 +217,8 @@ static inline u16 spr_a0(int sy, int shape) { return (u16)((sy & 0xFF) | (shape 
 static inline u16 spr_a1(int sx, int size, int flip) { return (u16)((sx & 0x1FF) | (flip << 12) | (size << 14)); }
 
 static void oam_build(void) {
-    static Spr units[MAX_ENEMIES + 2];
-    int nu = 0;
+    static Spr units[MAX_ENEMIES + 3];
+    int nu = 0, boss_drawn = 0, boss_flip = 0;
     oam_n = 0;
 
     if (title_mode_sprite) {
@@ -225,6 +232,13 @@ static void oam_build(void) {
             if (sx < -16 || sx > 240 || sy < -16 || sy > 160) continue;
             int tile = OBJ_MISC + ((g.frame >> 2) & 1 ? MISC_SHOT_B : MISC_SHOT_A);
             oam_push(spr_a0(sy, 0), spr_a1(sx, 1, 0), (u16)(tile | (2 << 10) | (PAL_SHOT << 12)));
+        }
+        for (int i = 0; i < MAX_ESHOTS; i++) {
+            EShot *e = &g.es[i]; if (!e->alive) continue;
+            int sx = (e->x >> 8) - cam_x - 8, sy = (e->y >> 8) - cam_y - 8;
+            if (sx < -16 || sx > 240 || sy < -16 || sy > 160) continue;
+            int tile = OBJ_MISC + ((g.frame >> 2) & 1 ? MISC_SHOT_A : MISC_SHOT_B);
+            oam_push(spr_a0(sy, 0), spr_a1(sx, 1, 0), (u16)(tile | (2 << 10) | (PAL_EBULLET << 12)));
         }
         /* enemies + player, lower on screen = drawn on top */
         for (int i = 0; i < MAX_ENEMIES; i++) {
@@ -240,6 +254,22 @@ static void oam_build(void) {
             u->key = (s16)(e->y >> 8);
             u->a0 = spr_a0(sy, 0); u->a1 = spr_a1(sx, 2, (slot == 1 && vx < 0));
             u->a2 = (u16)(tile | (2 << 10) | (pal << 12));
+        }
+        if (g.boss.alive) {                                     /* 32x32 sprite scaled 2x with an affine, double-size OBJ */
+            Boss *b = &g.boss;
+            int cx = (b->x >> 8) - cam_x, cy = (b->y >> 8) - cam_y - 16;   /* sprite centre; feet stay on b->y */
+            int vx = g.px - b->x, vy = g.py - b->y;
+            int slot = (iabs(vy) > 2 * iabs(vx)) ? (vy > 0 ? 0 : 2) : 1;
+            int frame = (g.frame >> 3) & 3;
+            int tile = OBJ_ENEMY + 3 * ENEMY_TILES + (slot * 4 + frame) * 16;
+            int pal = b->flash ? PAL_FLASH : PAL_ENEMY0 + 3;
+            Spr *u = &units[nu++];
+            u->key = (s16)(b->y >> 8);
+            u->a0 = (u16)(((cy - 32) & 0xFF) | 0x300);              /* affine + double size, square */
+            u->a1 = (u16)(((cx - 32) & 0x1FF) | (2 << 14));         /* affine group 0, 32x32 */
+            u->a2 = (u16)(tile | (2 << 10) | (pal << 12));
+            boss_flip = (slot == 1 && vx < 0);
+            boss_drawn = 1;
         }
         if (g.state != ST_OVER || g.result == 1) {
             if (!(g.inv > 0 && (g.inv & 4))) {
@@ -275,6 +305,8 @@ static void oam_build(void) {
         }
     }
     for (int i = oam_n; i < 128; i++) { oam_buf[i * 4] = 0x0200; oam_buf[i * 4 + 1] = 0; oam_buf[i * 4 + 2] = 0; }
+    /* affine group 0 lives in the 4th halfword of OAM entries 0..3: pa, pb, pc, pd (8.8) - 128 = magnify 2x */
+    oam_buf[3] = (u16)(boss_drawn ? (boss_flip ? -128 : 128) : 256); oam_buf[7] = 0; oam_buf[11] = 0; oam_buf[15] = (u16)(boss_drawn ? 128 : 256);
 }
 
 /* ============================================================== commit (VBlank) */
@@ -287,6 +319,15 @@ static void commit(void) {
     if (pl_want_species != pl_load_species || pl_want_row != pl_load_row || pl_want_frame != pl_load_frame) {
         copy32(OBJ_TILE_MEM(OBJ_PLAYER), species_tiles[pl_want_species][pl_want_row][pl_want_frame], 128);
         pl_load_species = pl_want_species; pl_load_row = pl_want_row; pl_load_frame = pl_want_frame;
+    }
+    if (boss_load >= 0) {
+        static const int rows[3] = { 0, 2, 4 };
+        for (int d = 0; d < 3; d++) for (int f = 0; f < 4; f++)
+            copy32(OBJ_TILE_MEM(OBJ_ENEMY + 3 * ENEMY_TILES + (d * 4 + f) * 16), species_tiles[boss_load][rows[d]][f], 128);
+        for (int i = 0; i < 16; i++) PAL_OBJ[(PAL_ENEMY0 + 3) * 16 + i] = species_pal[boss_load][i];
+        const Species *bs = &species[boss_load];
+        for (int i = 0; i < 3; i++) PAL_OBJ[PAL_EBULLET * 16 + 1 + i] = type_color[bs->t1][i];
+        boss_load = -1;
     }
     if (hud_dirty) { copy32(SCREENBLOCK(SB_HUD), hud, 512); hud_dirty = 0; }
     REG_BG0HOFS = (u16)(cam_x & 511); REG_BG0VOFS = (u16)(cam_y & 511);
@@ -373,11 +414,18 @@ static void run_start(int sp) {
     int cut[5] = { 0, n * 40 / 100, n * 70 / 100, n * 90 / 100, n };
     for (int t = 0; t < 4; t++) g.tier_species[t] = pool[cut[t] + rnd_n(cut[t + 1] - cut[t])];
 
+    /* the 3 bosses: drawn from the 4 strongest species, weakest fight first */
+    { int top[4], m = n - cut[3]; for (int i = 0; i < m && i < 4; i++) top[i] = pool[cut[3] + i];
+      for (int k = 0; k < NUM_BOSSES; k++) { int j = rnd_n(m - k); g.boss_species[k] = (u8)top[j]; top[j] = top[m - 1 - k]; }
+      for (int a = 0; a < NUM_BOSSES; a++) for (int b = a + 1; b < NUM_BOSSES; b++)
+          if (species[g.boss_species[b]].bst < species[g.boss_species[a]].bst) { u8 t = g.boss_species[a]; g.boss_species[a] = g.boss_species[b]; g.boss_species[b] = t; } }
+    g.tier_species[3] = g.boss_species[0];
+
     display_off();
     static const int dir_rows[3] = { 0, 2, 4 };                     /* Down, Right, Up */
     for (int t = 0; t < 4; t++) {
         const Species *es = &species[g.tier_species[t]];
-        for (int d = 0; d < 3; d++) for (int f = 0; f < 4; f++)
+        if (t < 3) for (int d = 0; d < 3; d++) for (int f = 0; f < 4; f++)
             copy32(OBJ_TILE_MEM(OBJ_ENEMY + t * ENEMY_TILES + (d * 4 + f) * 16), species_tiles[g.tier_species[t]][dir_rows[d]][f], 128);
         for (int i = 0; i < 16; i++) PAL_OBJ[(PAL_ENEMY0 + t) * 16 + i] = species_pal[g.tier_species[t]][i];
         g.mult_out[t] = (u8)type_mult(ps->t1, es->t1, es->t2);
@@ -392,12 +440,14 @@ static void run_start(int sp) {
     for (int i = 0; i < MAX_SHOTS; i++) g.sh[i].alive = 0;
     for (int i = 0; i < MAX_GEMS; i++) g.gem[i].alive = 0;
     for (int i = 0; i < MAX_HEARTS; i++) g.ht[i].alive = 0;
+    for (int i = 0; i < MAX_ESHOTS; i++) g.es[i].alive = 0;
+    g.boss.alive = 0; g.next_boss = 0; g.warn = 0; g.win = 0;
     for (int i = 0; i < UP_COUNT; i++) g.up[i] = 0;
     g.px = 0; g.py = 0; g.dir_row = 0; g.dir_flip = 0; g.anim = 0; g.moving = 0;
     g.maxhp = ps->hp; g.hp = g.maxhp; g.inv = 0;
     g.lvl = 1; g.xp = 0; g.xpneed = xp_for(1); g.kills = 0; g.t = 0;
     g.multi = 1; g.pierce = 0;
-    g.fire_cd = 30; g.spawn_cd = 20; g.elite_cd = ELITE_FIRST_FRAME; g.nen = 0; g.gem_next = 0;
+    g.fire_cd = 30; g.spawn_cd = 20; g.nen = 0; g.gem_next = 0;
     g.result = 0; g.new_best = 0;
 
     title_mode_sprite = 0;
@@ -449,6 +499,7 @@ static void kill_enemy(Enemy *e) {
 static void update_spawner(void) {
     int tsec = g.t / 60;
     int cap = imin(MAX_ENEMIES - 2, 16 + tsec / 4);
+    if (g.boss.alive) cap = 5;                 /* boss fights are 1-on-few: the swarm thins out */
     int interval = imax(8, 26 - tsec / 12);
     if (--g.spawn_cd <= 0) {
         g.spawn_cd = interval;
@@ -461,9 +512,111 @@ static void update_spawner(void) {
             spawn_enemy(tier);
         }
     }
-    if (g.t >= ELITE_FIRST_FRAME && --g.elite_cd <= 0) {
-        g.elite_cd = ELITE_EVERY_FRAME;
-        spawn_enemy(3);
+}
+
+
+/* ================================================================ bosses */
+static void hurt_player(int dmg) {
+    g.hp -= imax(1, dmg);
+    g.inv = INV_FRAMES;
+    sfx_hurt();
+}
+static void es_fire(s32 x, s32 y, int vx, int vy) {
+    for (int i = 0; i < MAX_ESHOTS; i++) {
+        EShot *e = &g.es[i]; if (e->alive) continue;
+        e->x = x; e->y = y; e->vx = vx; e->vy = vy; e->life = 170; e->alive = 1;
+        return;
+    }
+}
+static void boss_start(void) {
+    int i = g.next_boss++;
+    int sp = g.boss_species[i];
+    const Species *bs = &species[sp], *ps = &species[g.species];
+    static const u8 hp_mul[NUM_BOSSES] = { 2, 4, 7 };
+    Boss *b = &g.boss;
+    g.tier_species[3] = (u8)sp;
+    g.mult_out[3] = (u8)type_mult(ps->t1, bs->t1, bs->t2);
+    g.mult_in[3]  = (u8)type_mult(bs->t1, ps->t1, ps->t2);
+    b->alive = 1; b->idx = (u8)i; b->flash = 0; b->state = 0;
+    b->maxhp = bs->bst * hp_mul[i]; b->hp = b->maxhp;
+    b->atk_t = 70; b->dash_t = 240; b->timer = 0;
+    b->x = g.px + ((rnd_n(120) - 60) << 8); b->y = g.py - (130 << 8);
+    for (int k = 0; k < MAX_ESHOTS; k++) g.es[k].alive = 0;
+    g.warn = 150; boss_load = sp;
+    sfx_levelup();
+}
+static void boss_defeat(void) {
+    Boss *b = &g.boss;
+    b->alive = 0; g.kills += 5;
+    for (int k = 0; k < MAX_ESHOTS; k++) g.es[k].alive = 0;
+    for (int k = 0; k < 8; k++) spawn_gem(b->x + ((rnd_n(61) - 30) << 8), b->y + ((rnd_n(41) - 20) << 8), 2);
+    spawn_heart(b->x - (10 << 8), b->y); spawn_heart(b->x + (10 << 8), b->y);
+    sfx_levelup();
+    if (b->idx == NUM_BOSSES - 1) g.win = 1;
+}
+static void boss_aimed(int n) {
+    Boss *b = &g.boss;
+    int cx = b->x, cy = b->y - (16 << 8);
+    int nx, ny; norm_to(g.px - cx, (g.py - (8 << 8)) - cy, 256, &nx, &ny);
+    for (int k = 0; k < n; k++) {
+        int m = 2 * k - (n - 1), am = iabs(m);
+        int c = ROT_C[am], sn = m < 0 ? -ROT_S[am] : ROT_S[am];
+        int rx = (nx * c - ny * sn) >> 8, ry = (nx * sn + ny * c) >> 8;
+        es_fire(cx, cy, rx * ES_SPEED / 256, ry * ES_SPEED / 256);
+    }
+}
+static void boss_ring(int odd) {
+    Boss *b = &g.boss;
+    int speed = ES_SPEED * 3 / 4;
+    for (int k = odd; k < 24; k += 2)
+        es_fire(b->x, b->y - (16 << 8), DIR24[k][0] * speed / 256, DIR24[k][1] * speed / 256);
+}
+static void update_boss(void) {
+    Boss *b = &g.boss; if (!b->alive) return;
+    int idx = b->idx;
+    if (b->flash) b->flash--;
+    int dx = g.px - b->x, dy = g.py - b->y, ad = approx_dist(dx, dy);
+    if (b->state == 0) {                                            /* stalk the player and shoot */
+        int sp = 120 + 30 * idx;
+        if (ad > (58 << 8)) { b->x += dx * sp / ad; b->y += dy * sp / ad; }
+        if (--b->atk_t <= 0) {
+            static const u8 period[NUM_BOSSES] = { 105, 85, 70 };
+            int per = period[idx];
+            if (idx == 2 && b->hp * 2 < b->maxhp) per = per * 2 / 3;   /* final boss enrages at 50% */
+            b->atk_t = (s16)per; b->timer++;
+            if (!(b->timer & 1)) boss_aimed(idx == 2 ? 5 : 3);
+            else boss_ring((b->timer >> 1) & 1);
+            sfx_shoot();
+        }
+        if (idx >= 1 && --b->dash_t <= 0) {                         /* bosses 2 and 3 also charge */
+            b->state = 1; b->dash_t = 40;
+            norm_to(dx, dy, (idx == 2 ? 900 : 780), &b->dvx, &b->dvy);
+        }
+    } else if (b->state == 1) {                                     /* wind-up: blinks white */
+        if (g.frame & 4) b->flash = 2;
+        if (--b->dash_t <= 0) { b->state = 2; b->dash_t = 34; }
+    } else {                                                        /* dash */
+        b->x += b->dvx; b->y += b->dvy;
+        if (--b->dash_t <= 0) { b->state = 0; b->dash_t = (s16)(270 - idx * 50); }
+    }
+    if (idx == 2 && b->hp * 2 < b->maxhp && (g.t % 220) == 0 && g.nen < 18) spawn_enemy(2);   /* enraged: calls reinforcements */
+    if (g.inv == 0) {                                               /* touching the boss hurts */
+        int cx = (b->x - g.px) >> 8, cy = ((b->y - (14 << 8)) - (g.py - (8 << 8))) >> 8;
+        if (cx * cx + cy * cy < 22 * 22) hurt_player((10 + 4 * idx) * g.mult_in[3] / 100);
+    }
+}
+static void update_eshots(void) {
+    for (int i = 0; i < MAX_ESHOTS; i++) {
+        EShot *e = &g.es[i]; if (!e->alive) continue;
+        e->x += e->vx; e->y += e->vy;
+        if (--e->life == 0) { e->alive = 0; continue; }
+        if (g.inv == 0) {
+            int dx = (e->x - g.px) >> 8, dy = (e->y - (g.py - (8 << 8))) >> 8;
+            if (dx * dx + dy * dy < 9 * 9) {
+                hurt_player((5 + 3 * g.boss.idx) * g.mult_in[3] / 100);
+                e->alive = 0;
+            }
+        }
     }
 }
 
@@ -526,13 +679,16 @@ static void auto_fire(void) {
         int d = approx_dist((e->x - cx) >> 8, ((e->y - (8 << 8)) - cy) >> 8);
         if (d < bd) { bd = d; best = i; }
     }
+    int tx = 0, ty = 0;
+    if (best >= 0) { tx = g.en[best].x; ty = g.en[best].y - (8 << 8); }
+    if (g.boss.alive) {
+        int d = approx_dist((g.boss.x - cx) >> 8, ((g.boss.y - (16 << 8)) - cy) >> 8);
+        if (d < 150) { best = 0; tx = g.boss.x; ty = g.boss.y - (16 << 8); }        /* boss in range: always the priority target */
+    }
     if (best < 0) { g.fire_cd = 0; return; }
     g.fire_cd = fire_interval();
-    Enemy *t = &g.en[best];
     int nx, ny;
-    norm_to(t->x - cx, (t->y - (8 << 8)) - cy, 256, &nx, &ny);
-    static const s16 ROT_C[5] = { 256, 255, 250, 243, 234 };       /* cos, sin of m * 6 degrees */
-    static const s16 ROT_S[5] = { 0, 27, 53, 79, 104 };
+    norm_to(tx - cx, ty - cy, 256, &nx, &ny);
     int dmg = imax(1, 10 * species[g.species].atk * (100 + 25 * g.up[UP_POWER]) / 10000);
     for (int k = 0; k < g.multi; k++) {
         int m = 2 * k - (g.multi - 1), am = iabs(m);
@@ -567,6 +723,17 @@ static void update_shots(void) {
             s->hit = (u8)(j + 1);
             if (s->pierce) s->pierce--; else s->alive = 0;
             break;
+        }
+        if (s->alive && g.boss.alive && s->hit != 255) {
+            Boss *b = &g.boss;
+            int dx = (b->x - s->x) >> 8, dy = ((b->y - (16 << 8)) - s->y) >> 8;
+            if (dx * dx + dy * dy < 24 * 24) {
+                b->hp -= imax(1, s->dmg * g.mult_out[3] / 100);
+                b->flash = 3; sfx_hit();
+                s->hit = 255;
+                if (s->pierce) s->pierce--; else s->alive = 0;
+                if (b->hp <= 0) boss_defeat();
+            }
         }
     }
 }
@@ -680,12 +847,21 @@ static void levelup_update(void) {
 
 /* ===================================================================== HUD */
 static void hud_play(void) {
-    hud_clear_rows(0, 1);
+    hud_clear_rows(0, 2);
+    hud_clear_rows(8, 9);
     put_text(0, 0, "HP", TP_GOLD);
     put_bar(0, 2, 10, g.hp * 80 / imax(1, g.maxhp), TP_HP);
     put_time(0, 13, g.t, TP_WHITE);
     put_text(0, 22, "LV", TP_GOLD); put_num(0, 25, g.lvl, 3, TP_WHITE);
     put_bar(1, 0, 30, g.xp * 240 / g.xpneed, TP_XP);
+    if (g.boss.alive) {
+        put_text(2, 0, "BOSS", TP_GOLD);
+        put_bar(2, 5, 24, (int)(g.boss.hp * 192 / g.boss.maxhp), TP_HP);
+    }
+    if (g.warn > 0) {
+        g.warn--;
+        if (g.warn & 8) { put_text_c(8, "WARNING!", TP_GOLD); put_text_c(9, species[g.tier_species[3]].name, TP_WHITE); }
+    }
     hud_clear_rows(19, 19);
     put_text(19, 0, "KO", TP_GOLD); put_num(19, 3, g.kills, 4, TP_WHITE);
 }
@@ -693,7 +869,7 @@ static void hud_play(void) {
 /* ================================================================== states */
 static void over_enter(int cleared) {
     g.state = ST_OVER; g.result = cleared;
-    int t = cleared ? WIN_FRAMES : g.t;
+    int t = g.t;
     g.new_best = 0;
     if (t > g.best) { g.best = t; g.new_best = 1; save_write(); }
     hud_clear();
@@ -714,14 +890,17 @@ static void play_update(void) {
     g.t++;
     if (sfx_cd > 0) sfx_cd--;
     update_player();
+    if (g.next_boss < NUM_BOSSES && !g.boss.alive && g.t >= BOSS_AT_SEC[g.next_boss] * 60) boss_start();
     update_spawner();
     update_enemies();
+    update_boss();
+    update_eshots();
     auto_fire();
     update_shots();
     update_pickups();
     cam_x = (g.px >> 8) - 120; cam_y = (g.py >> 8) - 88;
     if (g.hp <= 0) { g.hp = 0; over_enter(0); return; }
-    if (g.t >= WIN_FRAMES) { over_enter(1); return; }
+    if (g.win) { over_enter(1); return; }
     if (g.xp >= g.xpneed) { g.xp -= g.xpneed; g.lvl++; g.xpneed = xp_for(g.lvl); levelup_enter(); return; }
     hud_play();
 }
